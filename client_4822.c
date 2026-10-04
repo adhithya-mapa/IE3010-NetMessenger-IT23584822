@@ -19,11 +19,13 @@ int main(void)
 
     char buffer[BUFFER_SIZE];
 
-    /* -------------------------------------------------- */
-    /* 1. Create client socket                            */
-    /* -------------------------------------------------- */
+    /* ------------------------------------------------ */
+    /* Create socket                                    */
+    /* ------------------------------------------------ */
 
-    client_fd = socket(AF_INET, SOCK_STREAM, 0);
+    client_fd = socket(AF_INET,
+                       SOCK_STREAM,
+                       0);
 
     if (client_fd < 0)
     {
@@ -33,14 +35,21 @@ int main(void)
 
     printf("Client socket created successfully.\n");
 
-    /* -------------------------------------------------- */
-    /* 2. Configure server address                        */
-    /* -------------------------------------------------- */
 
-    memset(&server_addr, 0, sizeof(server_addr));
+    /* ------------------------------------------------ */
+    /* Configure server                                 */
+    /* ------------------------------------------------ */
 
-    server_addr.sin_family = AF_INET;
-    server_addr.sin_port = htons(PORT);
+    memset(&server_addr,
+           0,
+           sizeof(server_addr));
+
+    server_addr.sin_family =
+        AF_INET;
+
+    server_addr.sin_port =
+        htons(PORT);
+
 
     if (inet_pton(AF_INET,
                   "127.0.0.1",
@@ -51,9 +60,10 @@ int main(void)
         exit(EXIT_FAILURE);
     }
 
-    /* -------------------------------------------------- */
-    /* 3. Connect to server                               */
-    /* -------------------------------------------------- */
+
+    /* ------------------------------------------------ */
+    /* Connect                                         */
+    /* ------------------------------------------------ */
 
     if (connect(client_fd,
                 (struct sockaddr *)&server_addr,
@@ -64,11 +74,13 @@ int main(void)
         exit(EXIT_FAILURE);
     }
 
-    printf("Connected to server on port %d.\n", PORT);
+    printf("Connected to server on port %d.\n",
+           PORT);
 
-    /* -------------------------------------------------- */
-    /* 4. Get username                                    */
-    /* -------------------------------------------------- */
+
+    /* ------------------------------------------------ */
+    /* Register username                                */
+    /* ------------------------------------------------ */
 
     char username[50];
 
@@ -82,34 +94,41 @@ int main(void)
         return 1;
     }
 
-    username[strcspn(username, "\r\n")] = '\0';
+    username[strcspn(username,
+                     "\r\n")] = '\0';
 
-    /* -------------------------------------------------- */
-    /* 5. Send REGISTER command                           */
-    /* -------------------------------------------------- */
 
     snprintf(buffer,
              sizeof(buffer),
-             "REGISTER %s",
+             "REGISTER %s\n",
              username);
+
 
     send(client_fd,
          buffer,
          strlen(buffer),
          0);
 
-    printf("Sent: %s\n", buffer);
 
-    /* -------------------------------------------------- */
-    /* 6. Receive registration response                   */
-    /* -------------------------------------------------- */
+    printf("Sent: REGISTER %s\n",
+           username);
 
-    memset(buffer, 0, sizeof(buffer));
 
-    int bytes_received = recv(client_fd,
-                              buffer,
-                              sizeof(buffer) - 1,
-                              0);
+    /* ------------------------------------------------ */
+    /* Receive registration response                    */
+    /* ------------------------------------------------ */
+
+    memset(buffer,
+           0,
+           sizeof(buffer));
+
+
+    int bytes_received =
+        recv(client_fd,
+             buffer,
+             sizeof(buffer) - 1,
+             0);
+
 
     if (bytes_received <= 0)
     {
@@ -118,19 +137,27 @@ int main(void)
         return 1;
     }
 
-    buffer[bytes_received] = '\0';
 
-    printf("Server: %s\n", buffer);
+    buffer[bytes_received] =
+        '\0';
 
-    /* -------------------------------------------------- */
-    /* 7. Command loop                                    */
-    /* -------------------------------------------------- */
+
+    printf("Server: %s",
+           buffer);
+
+
+    /* ------------------------------------------------ */
+    /* Command loop                                     */
+    /* ------------------------------------------------ */
 
     while (1)
     {
         printf("\nEnter command (LIST / QUIT): ");
 
-        memset(buffer, 0, sizeof(buffer));
+        memset(buffer,
+               0,
+               sizeof(buffer));
+
 
         if (fgets(buffer,
                   sizeof(buffer),
@@ -139,29 +166,49 @@ int main(void)
             break;
         }
 
-        buffer[strcspn(buffer, "\r\n")] = '\0';
 
-        /* Don't send empty commands */
+        /* Remove existing newline */
+
+        buffer[strcspn(buffer,
+                       "\r\n")] = '\0';
+
+
         if (strlen(buffer) == 0)
         {
             continue;
         }
 
+
+        /* Add newline for protocol */
+
+        strcat(buffer, "\n");
+
+
         /* Send command */
+
         send(client_fd,
              buffer,
              strlen(buffer),
              0);
 
-        printf("Sent: %s\n", buffer);
+
+        printf("Sent: %s",
+               buffer);
+
 
         /* Receive response */
-        memset(buffer, 0, sizeof(buffer));
 
-        bytes_received = recv(client_fd,
-                              buffer,
-                              sizeof(buffer) - 1,
-                              0);
+        memset(buffer,
+               0,
+               sizeof(buffer));
+
+
+        bytes_received =
+            recv(client_fd,
+                 buffer,
+                 sizeof(buffer) - 1,
+                 0);
+
 
         if (bytes_received <= 0)
         {
@@ -169,20 +216,28 @@ int main(void)
             break;
         }
 
-        buffer[bytes_received] = '\0';
 
-        printf("Server: %s\n", buffer);
+        buffer[bytes_received] =
+            '\0';
 
-        /* Stop if QUIT was sent */
-        if (strcmp(buffer, "OK BYE NID:5848") == 0)
+
+        printf("Server: %s",
+               buffer);
+
+
+        /* Check QUIT response */
+
+        if (strcmp(buffer,
+                   "OK BYE NID:5848\n") == 0)
         {
             break;
         }
     }
 
-    /* -------------------------------------------------- */
-    /* 8. Close client socket                             */
-    /* -------------------------------------------------- */
+
+    /* ------------------------------------------------ */
+    /* Close                                            */
+    /* ------------------------------------------------ */
 
     close(client_fd);
 
