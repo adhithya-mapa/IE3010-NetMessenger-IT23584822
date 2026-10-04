@@ -19,7 +19,10 @@ int main(void)
 
     char buffer[BUFFER_SIZE];
 
-    /* 1. Create client socket */
+    /* -------------------------------------------------- */
+    /* 1. Create client socket                            */
+    /* -------------------------------------------------- */
+
     client_fd = socket(AF_INET, SOCK_STREAM, 0);
 
     if (client_fd < 0)
@@ -30,13 +33,17 @@ int main(void)
 
     printf("Client socket created successfully.\n");
 
-    /* 2. Configure server address */
+    /* -------------------------------------------------- */
+    /* 2. Configure server address                        */
+    /* -------------------------------------------------- */
+
     memset(&server_addr, 0, sizeof(server_addr));
 
     server_addr.sin_family = AF_INET;
     server_addr.sin_port = htons(PORT);
 
-    if (inet_pton(AF_INET, "127.0.0.1",
+    if (inet_pton(AF_INET,
+                  "127.0.0.1",
                   &server_addr.sin_addr) <= 0)
     {
         perror("inet_pton");
@@ -44,7 +51,10 @@ int main(void)
         exit(EXIT_FAILURE);
     }
 
-    /* 3. Connect to server */
+    /* -------------------------------------------------- */
+    /* 3. Connect to server                               */
+    /* -------------------------------------------------- */
+
     if (connect(client_fd,
                 (struct sockaddr *)&server_addr,
                 sizeof(server_addr)) < 0)
@@ -56,17 +66,44 @@ int main(void)
 
     printf("Connected to server on port %d.\n", PORT);
 
-    /* 4. Send a test message */
-    const char *message = "Hello from NetMessenger client!";
+    /* -------------------------------------------------- */
+    /* 4. Get username                                    */
+    /* -------------------------------------------------- */
+
+    char username[50];
+
+    printf("\nEnter username: ");
+
+    if (fgets(username,
+              sizeof(username),
+              stdin) == NULL)
+    {
+        close(client_fd);
+        return 1;
+    }
+
+    username[strcspn(username, "\r\n")] = '\0';
+
+    /* -------------------------------------------------- */
+    /* 5. Send REGISTER command                           */
+    /* -------------------------------------------------- */
+
+    snprintf(buffer,
+             sizeof(buffer),
+             "REGISTER %s",
+             username);
 
     send(client_fd,
-         message,
-         strlen(message),
+         buffer,
+         strlen(buffer),
          0);
 
-    printf("Message sent to server.\n");
+    printf("Sent: %s\n", buffer);
 
-    /* 5. Receive server response */
+    /* -------------------------------------------------- */
+    /* 6. Receive registration response                   */
+    /* -------------------------------------------------- */
+
     memset(buffer, 0, sizeof(buffer));
 
     int bytes_received = recv(client_fd,
@@ -74,18 +111,79 @@ int main(void)
                               sizeof(buffer) - 1,
                               0);
 
-    if (bytes_received < 0)
+    if (bytes_received <= 0)
     {
-        perror("recv");
+        printf("Server disconnected.\n");
+        close(client_fd);
+        return 1;
     }
-    else
+
+    buffer[bytes_received] = '\0';
+
+    printf("Server: %s\n", buffer);
+
+    /* -------------------------------------------------- */
+    /* 7. Command loop                                    */
+    /* -------------------------------------------------- */
+
+    while (1)
     {
+        printf("\nEnter command (LIST / QUIT): ");
+
+        memset(buffer, 0, sizeof(buffer));
+
+        if (fgets(buffer,
+                  sizeof(buffer),
+                  stdin) == NULL)
+        {
+            break;
+        }
+
+        buffer[strcspn(buffer, "\r\n")] = '\0';
+
+        /* Don't send empty commands */
+        if (strlen(buffer) == 0)
+        {
+            continue;
+        }
+
+        /* Send command */
+        send(client_fd,
+             buffer,
+             strlen(buffer),
+             0);
+
+        printf("Sent: %s\n", buffer);
+
+        /* Receive response */
+        memset(buffer, 0, sizeof(buffer));
+
+        bytes_received = recv(client_fd,
+                              buffer,
+                              sizeof(buffer) - 1,
+                              0);
+
+        if (bytes_received <= 0)
+        {
+            printf("Server disconnected.\n");
+            break;
+        }
+
         buffer[bytes_received] = '\0';
 
-        printf("Server says: %s\n", buffer);
+        printf("Server: %s\n", buffer);
+
+        /* Stop if QUIT was sent */
+        if (strcmp(buffer, "OK BYE NID:5848") == 0)
+        {
+            break;
+        }
     }
 
-    /* 6. Close connection */
+    /* -------------------------------------------------- */
+    /* 8. Close client socket                             */
+    /* -------------------------------------------------- */
+
     close(client_fd);
 
     printf("Client closed.\n");
