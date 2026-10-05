@@ -152,7 +152,15 @@ int main(void)
 
     while (1)
     {
-        printf("\nEnter command (LIST / BCAST <message> / PMSG <user> <message> / QUIT): ");
+printf("\nCommands:\n");
+printf("  LIST\n");
+printf("  BCAST <message>\n");
+printf("  PMSG <user> <message>\n");
+printf("  JOIN <room>\n");
+printf("  LEAVE\n");
+printf("  RMSG <room> <message>\n");
+printf("  QUIT\n");
+printf("Enter command: ");
 
         memset(buffer,
                0,

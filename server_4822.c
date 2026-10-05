@@ -21,7 +21,7 @@ typedef struct
     int fd;
     int registered;
     char username[USERNAME_SIZE];
-
+    char room[USERNAME_SIZE];
     char input_buffer[BUFFER_SIZE];
     int input_length;
 
@@ -61,6 +61,7 @@ void remove_client(Client clients[], int index, fd_set *master_set)
         clients[index].fd = -1;
         clients[index].registered = 0;
         clients[index].username[0] = '\0';
+        clients[index].room[0]='\0';
         clients[index].input_length = 0;
         clients[index].input_buffer[0] = '\0';
     }
@@ -418,6 +419,235 @@ else if (strncmp(command, "PMSG ", 5) == 0)
     return 0;
 }
 
+/* ================================================= */
+/* JOIN                                               */
+/* ================================================= */
+
+else if (strncmp(command, "JOIN ", 5) == 0)
+{
+    if (!client->registered)
+    {
+        snprintf(response,
+                 sizeof(response),
+                 "ERR 002 NOT_REGISTERED %s\n",
+                 NID);
+
+        send_response(client->fd, response);
+
+        return 0;
+    }
+
+    char room[USERNAME_SIZE];
+
+    memset(room, 0, sizeof(room));
+
+    sscanf(command + 5, "%49s", room);
+
+    if (strlen(room) == 0)
+    {
+        snprintf(response,
+                 sizeof(response),
+                 "ERR 011 INVALID_ROOM %s\n",
+                 NID);
+
+        send_response(client->fd, response);
+
+        return 0;
+    }
+
+    strcpy(client->room, room);
+
+    snprintf(response,
+             sizeof(response),
+             "OK JOINED %s %s\n",
+             room,
+             NID);
+
+    send_response(client->fd, response);
+
+    printf("%s joined room %s\n",
+           client->username,
+           room);
+
+    return 0;
+}
+
+/* ================================================= */
+/* LEAVE                                              */
+/* ================================================= */
+
+else if (strcmp(command, "LEAVE") == 0)
+{
+    if (!client->registered)
+    {
+        snprintf(response,
+                 sizeof(response),
+                 "ERR 002 NOT_REGISTERED %s\n",
+                 NID);
+
+        send_response(client->fd, response);
+
+        return 0;
+    }
+
+    if (strlen(client->room) == 0)
+    {
+        snprintf(response,
+                 sizeof(response),
+                 "ERR 012 NOT_IN_ROOM %s\n",
+                 NID);
+
+        send_response(client->fd, response);
+
+        return 0;
+    }
+
+    char old_room[USERNAME_SIZE];
+
+    strcpy(old_room, client->room);
+
+    client->room[0] = '\0';
+
+    snprintf(response,
+             sizeof(response),
+             "OK LEFT %s %s\n",
+             old_room,
+             NID);
+
+    send_response(client->fd, response);
+
+    printf("%s left room %s\n",
+           client->username,
+           old_room);
+
+    return 0;
+}
+
+/* ================================================= */
+/* RMSG                                               */
+/* ================================================= */
+
+else if (strncmp(command, "RMSG ", 5) == 0)
+{
+    if (!client->registered)
+    {
+        snprintf(response,
+                 sizeof(response),
+                 "ERR 002 NOT_REGISTERED %s\n",
+                 NID);
+
+        send_response(client->fd, response);
+
+        return 0;
+    }
+
+    char room[USERNAME_SIZE];
+    char message[BUFFER_SIZE];
+
+    memset(room, 0, sizeof(room));
+    memset(message, 0, sizeof(message));
+
+    char *space = strchr(command + 5, ' ');
+
+    if (space == NULL)
+    {
+        snprintf(response,
+                 sizeof(response),
+                 "ERR 013 INVALID_RMSG %s\n",
+                 NID);
+
+        send_response(client->fd, response);
+
+        return 0;
+    }
+
+    int room_length =
+        space - (command + 5);
+
+    if (room_length <= 0 ||
+        room_length >= USERNAME_SIZE)
+    {
+        snprintf(response,
+                 sizeof(response),
+                 "ERR 013 INVALID_RMSG %s\n",
+                 NID);
+
+        send_response(client->fd, response);
+
+        return 0;
+    }
+
+    strncpy(room,
+            command + 5,
+            room_length);
+
+    room[room_length] = '\0';
+
+    strcpy(message, space + 1);
+
+    if (strlen(message) == 0)
+    {
+        snprintf(response,
+                 sizeof(response),
+                 "ERR 013 INVALID_RMSG %s\n",
+                 NID);
+
+        send_response(client->fd, response);
+
+        return 0;
+    }
+
+    /* User must currently be in this room */
+
+    if (strcmp(client->room, room) != 0)
+    {
+        snprintf(response,
+                 sizeof(response),
+                 "ERR 014 NOT_IN_ROOM %s\n",
+                 NID);
+
+        send_response(client->fd, response);
+
+        return 0;
+    }
+
+    char room_message[BUFFER_SIZE];
+
+    snprintf(room_message,
+             sizeof(room_message),
+             "MSG ROOM %.49s FROM %.49s %.900s\n",
+             room,
+             client->username,
+             message);
+
+    int recipient_found = 0;
+
+    for (int i = 0; i < MAX_CLIENTS; i++)
+    {
+        if (clients[i].fd != -1 &&
+            clients[i].registered &&
+            strcmp(clients[i].room, room) == 0)
+        {
+            send_response(clients[i].fd,
+                          room_message);
+
+            recipient_found = 1;
+        }
+    }
+
+    if (!recipient_found)
+    {
+        snprintf(response,
+                 sizeof(response),
+                 "ERR 015 ROOM_EMPTY %s\n",
+                 NID);
+
+        send_response(client->fd, response);
+    }
+
+    return 0;
+}
+
     /* ================================================= */
     /* QUIT                                               */
     /* ================================================= */
@@ -479,6 +709,7 @@ int main(void)
         clients[i].fd = -1;
         clients[i].registered = 0;
         clients[i].username[0] = '\0';
+        clients[i].room[0]='\0';
         clients[i].input_length = 0;
         clients[i].input_buffer[0] = '\0';
     }
