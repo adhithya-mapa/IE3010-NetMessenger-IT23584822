@@ -152,7 +152,7 @@ int main(void)
 
     while (1)
     {
-        printf("\nEnter command (LIST / QUIT): ");
+        printf("\nEnter command (LIST / BCAST <message> / PMSG <user> <message> / QUIT): ");
 
         memset(buffer,
                0,

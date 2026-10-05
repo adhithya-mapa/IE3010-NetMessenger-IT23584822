@@ -241,7 +241,182 @@ int process_command(Client clients[],
 
         return 0;
     }
+/* ================================================= */
+/* BCAST                                              */
+/* ================================================= */
 
+else if (strncmp(command, "BCAST ", 6) == 0)
+{
+    if (!client->registered)
+    {
+        snprintf(response,
+                 sizeof(response),
+                 "ERR 002 NOT_REGISTERED %s\n",
+                 NID);
+
+        send_response(client->fd, response);
+
+        return 0;
+    }
+
+    char message[BUFFER_SIZE];
+
+    memset(message, 0, sizeof(message));
+
+    strcpy(message, command + 6);
+
+    if (strlen(message) == 0)
+    {
+        snprintf(response,
+                 sizeof(response),
+                 "ERR 008 INVALID_MESSAGE %s\n",
+                 NID);
+
+        send_response(client->fd, response);
+
+        return 0;
+    }
+
+    char broadcast_message[BUFFER_SIZE];
+
+    snprintf(broadcast_message,
+             sizeof(broadcast_message),
+             "MSG FROM %.49s %.950s\n",
+             client->username,
+             message);
+
+    for (int i = 0; i < MAX_CLIENTS; i++)
+    {
+        if (clients[i].fd != -1 &&
+            clients[i].registered)
+        {
+            send_response(clients[i].fd,
+                          broadcast_message);
+        }
+    }
+
+    return 0;
+}
+
+/* ================================================= */
+/* PMSG                                               */
+/* ================================================= */
+
+else if (strncmp(command, "PMSG ", 5) == 0)
+{
+    if (!client->registered)
+    {
+        snprintf(response,
+                 sizeof(response),
+                 "ERR 002 NOT_REGISTERED %s\n",
+                 NID);
+
+        send_response(client->fd, response);
+
+        return 0;
+    }
+
+    char target_username[USERNAME_SIZE];
+    char message[BUFFER_SIZE];
+
+    memset(target_username,
+           0,
+           sizeof(target_username));
+
+    memset(message,
+           0,
+           sizeof(message));
+
+    char *space = strchr(command + 5, ' ');
+
+    if (space == NULL)
+    {
+        snprintf(response,
+                 sizeof(response),
+                 "ERR 009 INVALID_PMSG %s\n",
+                 NID);
+
+        send_response(client->fd, response);
+
+        return 0;
+    }
+
+    int username_length =
+        space - (command + 5);
+
+    if (username_length <= 0 ||
+        username_length >= USERNAME_SIZE)
+    {
+        snprintf(response,
+                 sizeof(response),
+                 "ERR 009 INVALID_PMSG %s\n",
+                 NID);
+
+        send_response(client->fd, response);
+
+        return 0;
+    }
+
+    strncpy(target_username,
+            command + 5,
+            username_length);
+
+    target_username[username_length] =
+        '\0';
+
+    strcpy(message, space + 1);
+
+    if (strlen(message) == 0)
+    {
+        snprintf(response,
+                 sizeof(response),
+                 "ERR 009 INVALID_PMSG %s\n",
+                 NID);
+
+        send_response(client->fd, response);
+
+        return 0;
+    }
+
+    int target_found = 0;
+
+    for (int i = 0; i < MAX_CLIENTS; i++)
+    {
+        if (clients[i].fd != -1 &&
+            clients[i].registered &&
+            strcmp(clients[i].username,
+                   target_username) == 0)
+        {
+            char private_message[BUFFER_SIZE];
+
+            snprintf(private_message,
+                     sizeof(private_message),
+                     "MSG FROM %.49s %.950s\n",
+                     client->username,
+                     message);
+
+            send_response(clients[i].fd,
+                          private_message);
+
+            target_found = 1;
+
+            break;
+        }
+    }
+
+    if (!target_found)
+    {
+        snprintf(response,
+                 sizeof(response),
+                 "ERR 010 USER_NOT_FOUND %s\n",
+                 NID);
+
+        send_response(client->fd,
+                      response);
+    }
+
+    return 0;
+}
 
     /* ================================================= */
     /* QUIT                                               */
