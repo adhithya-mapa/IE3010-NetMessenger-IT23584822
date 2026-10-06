@@ -76,48 +76,6 @@ static int send_all(int fd,
 
 
 /* ========================================================= */
-/* Receive exact number of bytes                               */
-/* ========================================================= */
-
-static int receive_exact(int fd,
-                         void *buffer,
-                         size_t length)
-{
-    char *ptr = buffer;
-
-    size_t received = 0;
-
-    while (received < length)
-    {
-        ssize_t n =
-            recv(fd,
-                 ptr + received,
-                 length - received,
-                 0);
-
-        if (n < 0)
-        {
-            if (errno == EINTR)
-            {
-                continue;
-            }
-
-            return -1;
-        }
-
-        if (n == 0)
-        {
-            return -1;
-        }
-
-        received += (size_t)n;
-    }
-
-    return 0;
-}
-
-
-/* ========================================================= */
 /* Receive incoming file                                      */
 /* ========================================================= */
 
@@ -810,7 +768,7 @@ int main(void)
             /*
              * Normal command.
              */
-            char command_line[BUFFER_SIZE];
+            char command_line[BUFFER_SIZE + 2];
 
             snprintf(command_line,
                      sizeof(command_line),

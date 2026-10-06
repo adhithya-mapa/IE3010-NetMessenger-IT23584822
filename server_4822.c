@@ -10,6 +10,8 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <sys/select.h>
+#include <signal.h>
+#include <stdarg.h>
 
 #define PORT 10822
 #define NID "NID:5848"
@@ -61,12 +63,25 @@ typedef struct
 
 static Client clients[MAX_CLIENTS];
 
+static volatile sig_atomic_t server_running = 1;
+
+static void handle_sigint(int sig)
+{
+    (void)sig;
+    server_running = 0;
+}
+
 
 /* ========================================================= */
 /* Utility functions                                          */
 /* ========================================================= */
 
-static void log_event(const char *text)
+/*
+ * Write one line to the log file.
+ * Format: [YYYY-MM-DD HH:MM:SS] [LEVEL] text
+ */
+static void log_write(const char *level,
+                      const char *text)
 {
     FILE *fp = fopen(LOG_FILE, "a");
 
@@ -88,16 +103,43 @@ static void log_event(const char *text)
                  tm_info);
 
         fprintf(fp,
-                "[%s] %s\n",
+                "[%s] [%s] %s\n",
                 timebuf,
+                level,
                 text);
     }
     else
     {
-        fprintf(fp, "%s\n", text);
+        fprintf(fp, "[%s] %s\n", level, text);
     }
 
     fclose(fp);
+}
+
+
+static void log_event(const char *text)
+{
+    log_write("INFO", text);
+}
+
+
+static void log_error(const char *text)
+{
+    log_write("ERROR", text);
+}
+
+
+/* printf-style INFO logging */
+static void log_info(const char *fmt, ...)
+{
+    char buf[BUFFER_SIZE];
+    va_list ap;
+
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+
+    log_write("INFO", buf);
 }
 
 
@@ -140,6 +182,41 @@ static int send_all(int fd,
 static int send_line(int fd,
                      const char *line)
 {
+    /*
+     * Every error reply is also written to the log,
+     * so malformed commands, unknown users and unknown
+     * rooms are all recorded in one place.
+     */
+    if (strncmp(line, "ERR ", 4) == 0)
+    {
+        char text[BUFFER_SIZE];
+        const char *who = "unregistered";
+        int i;
+
+        for (i = 0; i < MAX_CLIENTS; i++)
+        {
+            if (clients[i].fd == fd &&
+                clients[i].registered)
+            {
+                who = clients[i].username;
+                break;
+            }
+        }
+
+        snprintf(text, sizeof(text), "%s", line);
+        text[strcspn(text, "\r\n")] = '\0';
+
+        {
+            char logmsg[BUFFER_SIZE + 128];
+
+            snprintf(logmsg, sizeof(logmsg),
+                     "Error sent to %s (fd=%d): %s",
+                     who, fd, text);
+
+            log_error(logmsg);
+        }
+    }
+
     return send_all(fd,
                     line,
                     strlen(line));
@@ -647,7 +724,7 @@ static int start_file_transfer(Client *client,
 
     mkdir(STORAGE_ROOT, 0755);
 
-    char sender_directory[1024];
+    char sender_directory[512];
 
     snprintf(sender_directory,
              sizeof(sender_directory),
@@ -724,6 +801,8 @@ static int process_command(Client *client,
                             const char *command,
                             fd_set *master_set)
 {
+    (void)master_set;   /* not used in this function */
+
     char response[BUFFER_SIZE];
 
     printf("fd=%d command=%s\n",
@@ -787,7 +866,7 @@ static int process_command(Client *client,
 
         snprintf(logmsg,
                  sizeof(logmsg),
-                 "REGISTER username=%s",
+                 "User registered: %s",
                  username);
 
         log_event(logmsg);
@@ -894,7 +973,9 @@ static int process_command(Client *client,
         send_line(client->fd,
                   response);
 
-        char msg[BUFFER_SIZE];
+        log_info("BCAST from %s", client->username);
+
+        char msg[BUFFER_SIZE + 256];
 
         snprintf(msg,
                  sizeof(msg),
@@ -963,7 +1044,9 @@ static int process_command(Client *client,
         send_line(client->fd,
                   response);
 
-        char msg[BUFFER_SIZE];
+        log_info("PMSG from %s to %s", client->username, receiver->username);
+
+        char msg[BUFFER_SIZE + 256];
 
         snprintf(msg,
                  sizeof(msg),
@@ -1015,6 +1098,8 @@ static int process_command(Client *client,
         send_line(client->fd,
                   response);
 
+        log_info("User %s joined %s", client->username, room);
+
         return 0;
     }
 
@@ -1023,9 +1108,8 @@ static int process_command(Client *client,
     /* LEAVE                                                   */
     /* ----------------------------------------------------- */
 
-    if (strncmp(command,
-                "LEAVE",
-                5) == 0)
+    if (strcmp(command, "LEAVE") == 0 ||
+        strncmp(command, "LEAVE ", 6) == 0)
     {
         char room[ROOM_SIZE];
 
@@ -1058,6 +1142,8 @@ static int process_command(Client *client,
 
         send_line(client->fd,
                   response);
+
+        log_info("User %s left %s", client->username, room);
 
         return 0;
     }
@@ -1193,7 +1279,9 @@ static int process_command(Client *client,
         send_line(client->fd,
                   response);
 
-        char msg[BUFFER_SIZE];
+        log_info("RMSG from %s to %s", client->username, room);
+
+        char msg[BUFFER_SIZE + 256];
 
         snprintf(msg,
                  sizeof(msg),
@@ -1243,6 +1331,8 @@ static int process_command(Client *client,
     {
         send_line(client->fd,
                   "OK BYE NID:5848\n");
+
+        log_info("User %s sent QUIT", client->username);
 
         return 1;
     }
@@ -1295,10 +1385,14 @@ static void remove_client(int index,
 
         snprintf(logmsg,
                  sizeof(logmsg),
-                 "DISCONNECT username=%s",
+                 "User disconnected: %s",
                  username);
 
         log_event(logmsg);
+    }
+    else
+    {
+        log_event("Unregistered client disconnected");
     }
 
     FD_CLR(client->fd,
@@ -1549,7 +1643,40 @@ int main(void)
     printf("========================================\n");
 
 
-    log_event("SERVER_STARTED");
+    /*
+     * A client that disconnects while we send() to it must
+     * not kill the server with SIGPIPE.
+     */
+    signal(SIGPIPE, SIG_IGN);
+
+    /*
+     * Ctrl+C stops the server cleanly (and logs it).
+     * No SA_RESTART, so select() returns EINTR.
+     */
+    {
+        struct sigaction sa;
+
+        memset(&sa, 0, sizeof(sa));
+        sa.sa_handler = handle_sigint;
+        sigemptyset(&sa.sa_mask);
+        sigaction(SIGINT, &sa, NULL);
+        sigaction(SIGTERM, &sa, NULL);
+    }
+
+    {
+        FILE *log_file = fopen(LOG_FILE, "a");
+
+        if (log_file == NULL)
+        {
+            perror("fopen");
+        }
+        else
+        {
+            fclose(log_file);
+        }
+    }
+
+    log_info("Server started on port %d", PORT);
 
 
     FD_ZERO(&master_set);
@@ -1560,7 +1687,7 @@ int main(void)
     max_fd = server_fd;
 
 
-    while (1)
+    while (server_running)
     {
         read_set = master_set;
 
@@ -1637,7 +1764,7 @@ int main(void)
                         printf("New client connected fd=%d\n",
                                new_fd);
 
-                        log_event("CLIENT_CONNECTED");
+                        log_event("Client connected");
 
                         break;
                     }
@@ -1742,7 +1869,9 @@ int main(void)
 
     close(server_fd);
 
-    log_event("SERVER_STOPPED");
+    log_event("Server stopped");
 
     return 0;
 }
+
+
