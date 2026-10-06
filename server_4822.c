@@ -2,90 +2,212 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-
+#include <errno.h>
+#include <time.h>
 #include <sys/types.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <sys/select.h>
 
 #define PORT 10822
-#define BUFFER_SIZE 1024
-#define MAX_CLIENTS 10
-#define USERNAME_SIZE 50
-
 #define NID "NID:5848"
+
+#define MAX_CLIENTS  FD_SETSIZE
+#define BUFFER_SIZE 4096
+#define USERNAME_SIZE 50
+#define ROOM_SIZE 50
+#define FILENAME_SIZE 256
+#define INPUT_SIZE 8192
+
+#define STORAGE_ROOT "./storage/IT23584822"
+#define LOG_FILE "netmsg_IT23584822.log"
 
 typedef struct
 {
     int fd;
     int registered;
+
     char username[USERNAME_SIZE];
-    char room[USERNAME_SIZE];
-    char input_buffer[BUFFER_SIZE];
-    int input_length;
+    char room[ROOM_SIZE];
+
+    /*
+     * Command input buffer.
+     *
+     * TCP does not guarantee one recv() == one command.
+     */
+    char input_buffer[INPUT_SIZE];
+    size_t input_length;
+
+    /*
+     * Incoming file state.
+     */
+    int receiving_file;
+    long file_size;
+    long file_received;
+
+    char file_name[FILENAME_SIZE];
+    char file_path[1024];
+
+    FILE *file_fp;
+
+    /*
+     * Target information for current file.
+     */
+    char file_target[USERNAME_SIZE];
 
 } Client;
 
-/* -------------------------------------------------- */
-/* Send a complete response                            */
-/* -------------------------------------------------- */
+static Client clients[MAX_CLIENTS];
 
-void send_response(int fd, const char *message)
+
+/* ========================================================= */
+/* Utility functions                                          */
+/* ========================================================= */
+
+static void log_event(const char *text)
 {
-    send(fd, message, strlen(message), 0);
+    FILE *fp = fopen(LOG_FILE, "a");
+
+    if (fp == NULL)
+    {
+        return;
+    }
+
+    time_t now = time(NULL);
+    struct tm *tm_info = localtime(&now);
+
+    if (tm_info != NULL)
+    {
+        char timebuf[64];
+
+        strftime(timebuf,
+                 sizeof(timebuf),
+                 "%Y-%m-%d %H:%M:%S",
+                 tm_info);
+
+        fprintf(fp,
+                "[%s] %s\n",
+                timebuf,
+                text);
+    }
+    else
+    {
+        fprintf(fp, "%s\n", text);
+    }
+
+    fclose(fp);
 }
 
 
-/* -------------------------------------------------- */
-/* Remove a client                                    */
-/* -------------------------------------------------- */
-
-void remove_client(Client clients[], int index, fd_set *master_set)
+static int send_all(int fd,
+                    const void *data,
+                    size_t length)
 {
-    if (clients[index].fd != -1)
-    {
-        printf("Client disconnected: fd=%d", clients[index].fd);
+    const char *ptr = data;
+    size_t sent = 0;
 
-        if (clients[index].registered)
+    while (sent < length)
+    {
+        ssize_t n = send(fd,
+                         ptr + sent,
+                         length - sent,
+                         0);
+
+        if (n < 0)
         {
-            printf(" username=%s", clients[index].username);
+            if (errno == EINTR)
+            {
+                continue;
+            }
+
+            return -1;
         }
 
-        printf("\n");
+        if (n == 0)
+        {
+            return -1;
+        }
 
-        close(clients[index].fd);
+        sent += (size_t)n;
+    }
 
-        FD_CLR(clients[index].fd, master_set);
+    return 0;
+}
 
-        clients[index].fd = -1;
-        clients[index].registered = 0;
-        clients[index].username[0] = '\0';
-        clients[index].room[0]='\0';
-        clients[index].input_length = 0;
-        clients[index].input_buffer[0] = '\0';
+
+static int send_line(int fd,
+                     const char *line)
+{
+    return send_all(fd,
+                    line,
+                    strlen(line));
+}
+
+
+static void reset_client(Client *client)
+{
+    client->registered = 0;
+
+    client->username[0] = '\0';
+    client->room[0] = '\0';
+
+    client->input_length = 0;
+
+    client->receiving_file = 0;
+    client->file_size = 0;
+    client->file_received = 0;
+
+    client->file_name[0] = '\0';
+    client->file_path[0] = '\0';
+    client->file_target[0] = '\0';
+
+    client->file_fp = NULL;
+}
+
+
+static void initialise_clients(void)
+{
+    int i;
+
+    for (i = 0; i < MAX_CLIENTS; i++)
+    {
+        clients[i].fd = -1;
+        reset_client(&clients[i]);
     }
 }
 
 
-/* -------------------------------------------------- */
-/* Check whether username already exists              */
-/* -------------------------------------------------- */
-
-int username_exists(Client clients[],
-                    int current_index,
-                    const char *username)
+static Client *find_username(const char *username)
 {
-    for (int i = 0; i < MAX_CLIENTS; i++)
-    {
-        if (i == current_index)
-        {
-            continue;
-        }
+    int i;
 
+    for (i = 0; i < MAX_CLIENTS; i++)
+    {
         if (clients[i].fd != -1 &&
             clients[i].registered &&
-            strcmp(clients[i].username, username) == 0)
+            strcmp(clients[i].username,
+                   username) == 0)
+        {
+            return &clients[i];
+        }
+    }
+
+    return NULL;
+}
+
+
+static int room_exists(const char *room)
+{
+    int i;
+
+    for (i = 0; i < MAX_CLIENTS; i++)
+    {
+        if (clients[i].fd != -1 &&
+            clients[i].registered &&
+            strcmp(clients[i].room,
+                   room) == 0)
         {
             return 1;
         }
@@ -95,84 +217,560 @@ int username_exists(Client clients[],
 }
 
 
-/* -------------------------------------------------- */
-/* Process one complete command                       */
-/* -------------------------------------------------- */
-
-int process_command(Client clients[],
-                    int index,
-                    const char *command,
-                    fd_set *master_set)
+static int room_member_count(const char *room)
 {
-    Client *client = &clients[index];
+    int count = 0;
+    int i;
 
+    for (i = 0; i < MAX_CLIENTS; i++)
+    {
+        if (clients[i].fd != -1 &&
+            clients[i].registered &&
+            strcmp(clients[i].room,
+                   room) == 0)
+        {
+            count++;
+        }
+    }
+
+    return count;
+}
+
+
+/* ========================================================= */
+/* Broadcast presence                                         */
+/* ========================================================= */
+
+static void notify_join(const Client *joined)
+{
+    char msg[BUFFER_SIZE];
+
+    snprintf(msg,
+             sizeof(msg),
+             "MSG JOIN %s\n",
+             joined->username);
+
+    int i;
+
+    for (i = 0; i < MAX_CLIENTS; i++)
+    {
+        if (clients[i].fd != -1 &&
+            clients[i].registered &&
+            &clients[i] != joined)
+        {
+            send_line(clients[i].fd, msg);
+        }
+    }
+}
+
+
+static void notify_leave(const char *username)
+{
+    char msg[BUFFER_SIZE];
+
+    snprintf(msg,
+             sizeof(msg),
+             "MSG LEAVE %s\n",
+             username);
+
+    int i;
+
+    for (i = 0; i < MAX_CLIENTS; i++)
+    {
+        if (clients[i].fd != -1 &&
+            clients[i].registered)
+        {
+            send_line(clients[i].fd, msg);
+        }
+    }
+}
+
+
+/* ========================================================= */
+/* File target helpers                                        */
+/* ========================================================= */
+
+static int target_is_room(const char *target)
+{
+    return room_exists(target);
+}
+
+
+static int safe_filename(const char *filename)
+{
+    if (filename == NULL ||
+        filename[0] == '\0')
+    {
+        return 0;
+    }
+
+    if (strstr(filename, "..") != NULL)
+    {
+        return 0;
+    }
+
+    if (strchr(filename, '/') != NULL)
+    {
+        return 0;
+    }
+
+    if (strchr(filename, '\\') != NULL)
+    {
+        return 0;
+    }
+
+    return 1;
+}
+
+
+/*
+ * Send a file to one receiver.
+ *
+ * Internal receiver framing:
+ *
+ * FILE_FROM <sender> <filename> <filesize>\n
+ * <exact raw bytes>
+ *
+ * This header is an implementation detail needed because the
+ * assignment specifies the sender->server framing but does not
+ * specify a receiver-side file header.
+ */
+static int send_file_to_client(Client *receiver,
+                               const char *sender,
+                               const char *filename,
+                               const char *path,
+                               long filesize)
+{
+    char header[BUFFER_SIZE];
+
+    int length = snprintf(header,
+                          sizeof(header),
+                          "FILE_FROM %s %s %ld\n",
+                          sender,
+                          filename,
+                          filesize);
+
+    if (length < 0 ||
+        (size_t)length >= sizeof(header))
+    {
+        return -1;
+    }
+
+    if (send_all(receiver->fd,
+                 header,
+                 (size_t)length) < 0)
+    {
+        return -1;
+    }
+
+    FILE *fp = fopen(path, "rb");
+
+    if (fp == NULL)
+    {
+        return -1;
+    }
+
+    char buffer[BUFFER_SIZE];
+
+    long remaining = filesize;
+
+    while (remaining > 0)
+    {
+        size_t wanted =
+            remaining > BUFFER_SIZE
+                ? BUFFER_SIZE
+                : (size_t)remaining;
+
+        size_t n = fread(buffer,
+                         1,
+                         wanted,
+                         fp);
+
+        if (n == 0)
+        {
+            fclose(fp);
+            return -1;
+        }
+
+        if (send_all(receiver->fd,
+                     buffer,
+                     n) < 0)
+        {
+            fclose(fp);
+            return -1;
+        }
+
+        remaining -= (long)n;
+    }
+
+    fclose(fp);
+
+    return 0;
+}
+
+
+static void deliver_file(Client *sender)
+{
+    /*
+     * Sender's file has already been completely received
+     * and stored.
+     */
+
+    if (target_is_room(sender->file_target))
+    {
+        int i;
+
+        for (i = 0; i < MAX_CLIENTS; i++)
+        {
+            if (clients[i].fd != -1 &&
+                clients[i].registered &&
+                strcmp(clients[i].room,
+                       sender->file_target) == 0 &&
+                &clients[i] != sender)
+            {
+                send_file_to_client(
+                    &clients[i],
+                    sender->username,
+                    sender->file_name,
+                    sender->file_path,
+                    sender->file_size);
+            }
+        }
+    }
+    else
+    {
+        Client *receiver =
+            find_username(sender->file_target);
+
+        if (receiver != NULL &&
+            receiver != sender)
+        {
+            send_file_to_client(
+                receiver,
+                sender->username,
+                sender->file_name,
+                sender->file_path,
+                sender->file_size);
+        }
+    }
+}
+
+
+/* ========================================================= */
+/* Complete incoming file                                     */
+/* ========================================================= */
+
+static void finish_file(Client *client)
+{
+    if (client->file_fp != NULL)
+    {
+        fclose(client->file_fp);
+        client->file_fp = NULL;
+    }
+
+    printf("File received from %s: %s (%ld bytes)\n",
+           client->username,
+           client->file_name,
+           client->file_size);
+
+    char logmsg[BUFFER_SIZE];
+
+    snprintf(logmsg,
+             sizeof(logmsg),
+             "FILE_RECEIVED sender=%s target=%s file=%s size=%ld",
+             client->username,
+             client->file_target,
+             client->file_name,
+             client->file_size);
+
+    log_event(logmsg);
+
+    /*
+     * Deliver the stored file to target(s).
+     */
+    deliver_file(client);
+
+    /*
+     * Response to sender.
+     */
     char response[BUFFER_SIZE];
 
-    printf("Client fd=%d sent: %s\n",
+    snprintf(response,
+             sizeof(response),
+             "OK FILE_RECEIVED %s %s\n",
+             client->file_name,
+             NID);
+
+    send_line(client->fd,
+              response);
+
+    /*
+     * Reset file state.
+     */
+    client->receiving_file = 0;
+    client->file_size = 0;
+    client->file_received = 0;
+
+    client->file_name[0] = '\0';
+    client->file_path[0] = '\0';
+    client->file_target[0] = '\0';
+}
+
+
+/* ========================================================= */
+/* Receive file bytes                                         */
+/* ========================================================= */
+
+static int receive_file_bytes(Client *client,
+                              const char *data,
+                              size_t length)
+{
+    size_t consumed = 0;
+
+    while (consumed < length &&
+           client->receiving_file)
+    {
+        long remaining =
+            client->file_size -
+            client->file_received;
+
+        if (remaining <= 0)
+        {
+            finish_file(client);
+            break;
+        }
+
+        size_t amount =
+            remaining < (long)(length - consumed)
+                ? (size_t)remaining
+                : length - consumed;
+
+        size_t written =
+            fwrite(data + consumed,
+                   1,
+                   amount,
+                   client->file_fp);
+
+        if (written != amount)
+        {
+            fclose(client->file_fp);
+            client->file_fp = NULL;
+
+            client->receiving_file = 0;
+
+            send_line(client->fd,
+                      "ERR 005 FILE_WRITE_ERROR NID:5848\n");
+
+            return -1;
+        }
+
+        client->file_received +=
+            (long)written;
+
+        consumed += written;
+
+        if (client->file_received ==
+            client->file_size)
+        {
+            finish_file(client);
+        }
+    }
+
+    return 0;
+}
+
+
+/* ========================================================= */
+/* Process SENDFILE command                                   */
+/* ========================================================= */
+
+static int start_file_transfer(Client *client,
+                               const char *command)
+{
+    char target[USERNAME_SIZE];
+    char filename[FILENAME_SIZE];
+    long filesize;
+
+    memset(target, 0, sizeof(target));
+    memset(filename, 0, sizeof(filename));
+
+    filesize = 0;
+
+    int fields =
+        sscanf(command,
+               "SENDFILE %49s %255s %ld",
+               target,
+               filename,
+               &filesize);
+
+    if (fields != 3 ||
+        filesize < 0 ||
+        !safe_filename(filename))
+    {
+        send_line(client->fd,
+                  "ERR 006 INVALID_SENDFILE NID:5848\n");
+
+        return 0;
+    }
+
+    /*
+     * Determine whether target is a user or room.
+     */
+    Client *target_client =
+        find_username(target);
+
+    if (target_client == NULL &&
+        !room_exists(target))
+    {
+        send_line(client->fd,
+                  "ERR 002 USER_NOT_FOUND NID:5848\n");
+
+        return 0;
+    }
+
+    /*
+     * If it is a room, make sure it actually has members.
+     */
+    if (target_client == NULL &&
+        room_member_count(target) == 0)
+    {
+        send_line(client->fd,
+                  "ERR 003 ROOM_NOT_FOUND NID:5848\n");
+
+        return 0;
+    }
+
+    /*
+     * Create personalised storage directory.
+     */
+    mkdir("storage", 0755);
+
+    mkdir(STORAGE_ROOT, 0755);
+
+    char sender_directory[1024];
+
+    snprintf(sender_directory,
+             sizeof(sender_directory),
+             "%s/%s",
+             STORAGE_ROOT,
+             client->username);
+
+    mkdir(sender_directory, 0755);
+
+    char filepath[1024];
+
+    snprintf(filepath,
+             sizeof(filepath),
+             "%s/%s",
+             sender_directory,
+             filename);
+
+    FILE *fp =
+        fopen(filepath, "wb");
+
+    if (fp == NULL)
+    {
+        send_line(client->fd,
+                  "ERR 005 FILE_WRITE_ERROR NID:5848\n");
+
+        return 0;
+    }
+
+    client->file_fp = fp;
+
+    client->receiving_file = 1;
+
+    client->file_size = filesize;
+    client->file_received = 0;
+
+    strncpy(client->file_name,
+            filename,
+            FILENAME_SIZE - 1);
+
+    client->file_name[FILENAME_SIZE - 1] =
+        '\0';
+
+    strncpy(client->file_path,
+            filepath,
+            sizeof(client->file_path) - 1);
+
+    client->file_path[
+        sizeof(client->file_path) - 1] =
+        '\0';
+
+    strncpy(client->file_target,
+            target,
+            USERNAME_SIZE - 1);
+
+    client->file_target[
+        USERNAME_SIZE - 1] =
+        '\0';
+
+    printf("Starting file transfer:\n");
+    printf("  Sender : %s\n", client->username);
+    printf("  Target : %s\n", target);
+    printf("  File   : %s\n", filename);
+    printf("  Size   : %ld bytes\n", filesize);
+
+    return 0;
+}
+
+
+/* ========================================================= */
+/* Process one complete text command                          */
+/* ========================================================= */
+
+static int process_command(Client *client,
+                            const char *command,
+                            fd_set *master_set)
+{
+    char response[BUFFER_SIZE];
+
+    printf("fd=%d command=%s\n",
            client->fd,
            command);
 
 
-    /* ================================================= */
-    /* REGISTER                                          */
-    /* ================================================= */
+    /* ----------------------------------------------------- */
+    /* REGISTER                                               */
+    /* ----------------------------------------------------- */
 
-    if (strncmp(command, "REGISTER ", 9) == 0)
+    if (strncmp(command,
+                "REGISTER ",
+                9) == 0)
     {
         char username[USERNAME_SIZE];
 
         memset(username, 0, sizeof(username));
 
-        sscanf(command + 9, "%49s", username);
-
-        if (strlen(username) == 0)
+        if (sscanf(command + 9,
+                   "%49s",
+                   username) != 1)
         {
-            snprintf(response,
-                     sizeof(response),
-                     "ERR 004 INVALID_USERNAME %s\n",
-                     NID);
-
-            send_response(client->fd, response);
+            send_line(client->fd,
+                      "ERR 004 INVALID_USERNAME NID:5848\n");
 
             return 0;
         }
-
-
-        /* Already registered */
 
         if (client->registered)
         {
-            snprintf(response,
-                     sizeof(response),
-                     "ERR 003 ALREADY_REGISTERED %s\n",
-                     NID);
-
-            send_response(client->fd, response);
+            send_line(client->fd,
+                      "ERR 003 ALREADY_REGISTERED NID:5848\n");
 
             return 0;
         }
 
-
-        /* Check duplicate username */
-
-        if (username_exists(clients,
-                             index,
-                             username))
+        if (find_username(username) != NULL)
         {
-            snprintf(response,
-                     sizeof(response),
-                     "ERR 001 USERNAME_TAKEN %s\n",
-                     NID);
-
-            send_response(client->fd, response);
+            send_line(client->fd,
+                      "ERR 001 USERNAME_TAKEN NID:5848\n");
 
             return 0;
         }
 
-
-        /* Register the user */
-
-        strcpy(client->username, username);
+        strcpy(client->username,
+               username);
 
         client->registered = 1;
 
@@ -182,514 +780,692 @@ int process_command(Client clients[],
                  username,
                  NID);
 
-        send_response(client->fd, response);
+        send_line(client->fd,
+                  response);
 
-        printf("User registered: %s\n",
-               username);
+        char logmsg[BUFFER_SIZE];
+
+        snprintf(logmsg,
+                 sizeof(logmsg),
+                 "REGISTER username=%s",
+                 username);
+
+        log_event(logmsg);
+
+        notify_join(client);
 
         return 0;
     }
 
 
-    /* ================================================= */
-    /* LIST                                               */
-    /* ================================================= */
+    /* ----------------------------------------------------- */
+    /* All commands after this require registration          */
+    /* ----------------------------------------------------- */
 
-    else if (strcmp(command, "LIST") == 0)
+    if (!client->registered)
     {
-        if (!client->registered)
-        {
-            snprintf(response,
-                     sizeof(response),
-                     "ERR 002 NOT_REGISTERED %s\n",
-                     NID);
+        send_line(client->fd,
+                  "ERR 002 NOT_REGISTERED NID:5848\n");
 
-            send_response(client->fd, response);
-
-            return 0;
-        }
+        return 0;
+    }
 
 
-        strcpy(response, "OK USERS ");
+    /* ----------------------------------------------------- */
+    /* LIST                                                    */
+    /* ----------------------------------------------------- */
 
-        for (int i = 0; i < MAX_CLIENTS; i++)
+    if (strcmp(command,
+               "LIST") == 0)
+    {
+        char users[BUFFER_SIZE];
+
+        strcpy(users,
+               "OK USERS ");
+
+        int first = 1;
+        int i;
+
+        for (i = 0; i < MAX_CLIENTS; i++)
         {
             if (clients[i].fd != -1 &&
                 clients[i].registered)
             {
-                strcat(response,
-                       clients[i].username);
+                if (!first)
+                {
+                    strncat(users,
+                            ",",
+                            sizeof(users) -
+                            strlen(users) - 1);
+                }
 
-                strcat(response, ",");
+                strncat(users,
+                        clients[i].username,
+                        sizeof(users) -
+                        strlen(users) - 1);
+
+                first = 0;
             }
         }
 
+        strncat(users,
+                " ",
+                sizeof(users) -
+                strlen(users) - 1);
 
-        /* Remove final comma */
+        strncat(users,
+                NID,
+                sizeof(users) -
+                strlen(users) - 1);
 
-        size_t length = strlen(response);
+        strncat(users,
+                "\n",
+                sizeof(users) -
+                strlen(users) - 1);
 
-        if (length > strlen("OK USERS "))
+        send_line(client->fd,
+                  users);
+
+        return 0;
+    }
+
+
+    /* ----------------------------------------------------- */
+    /* BCAST                                                   */
+    /* ----------------------------------------------------- */
+
+    if (strncmp(command,
+                "BCAST ",
+                6) == 0)
+    {
+        char message[BUFFER_SIZE];
+
+        strncpy(message,
+                command + 6,
+                sizeof(message) - 1);
+
+        message[sizeof(message) - 1] = '\0';
+
+        snprintf(response,
+                 sizeof(response),
+                 "OK SENT %s\n",
+                 NID);
+
+        send_line(client->fd,
+                  response);
+
+        char msg[BUFFER_SIZE];
+
+        snprintf(msg,
+                 sizeof(msg),
+                 "MSG BCAST %s %s\n",
+                 client->username,
+                 message);
+
+        int i;
+
+        for (i = 0; i < MAX_CLIENTS; i++)
         {
-            response[length - 1] = '\0';
+            if (clients[i].fd != -1 &&
+                clients[i].registered &&
+                &clients[i] != client)
+            {
+                send_line(clients[i].fd,
+                          msg);
+            }
         }
 
-        strcat(response, " ");
-        strcat(response, NID);
-        strcat(response, "\n");
-
-        send_response(client->fd, response);
-
-        return 0;
-    }
-/* ================================================= */
-/* BCAST                                              */
-/* ================================================= */
-
-else if (strncmp(command, "BCAST ", 6) == 0)
-{
-    if (!client->registered)
-    {
-        snprintf(response,
-                 sizeof(response),
-                 "ERR 002 NOT_REGISTERED %s\n",
-                 NID);
-
-        send_response(client->fd, response);
-
         return 0;
     }
 
-    char message[BUFFER_SIZE];
 
-    memset(message, 0, sizeof(message));
+    /* ----------------------------------------------------- */
+    /* PMSG                                                    */
+    /* ----------------------------------------------------- */
 
-    strcpy(message, command + 6);
-
-    if (strlen(message) == 0)
+    if (strncmp(command,
+                "PMSG ",
+                5) == 0)
     {
-        snprintf(response,
-                 sizeof(response),
-                 "ERR 008 INVALID_MESSAGE %s\n",
-                 NID);
+        char target[USERNAME_SIZE];
+        char message[BUFFER_SIZE];
 
-        send_response(client->fd, response);
+        memset(target, 0, sizeof(target));
+        memset(message, 0, sizeof(message));
 
-        return 0;
-    }
-
-    char broadcast_message[BUFFER_SIZE];
-
-    snprintf(broadcast_message,
-             sizeof(broadcast_message),
-             "MSG FROM %.49s %.950s\n",
-             client->username,
-             message);
-
-    for (int i = 0; i < MAX_CLIENTS; i++)
-    {
-        if (clients[i].fd != -1 &&
-            clients[i].registered)
+        if (sscanf(command,
+                   "PMSG %49s %1023[^\n]",
+                   target,
+                   message) != 2)
         {
-            send_response(clients[i].fd,
-                          broadcast_message);
+            send_line(client->fd,
+                      "ERR 006 INVALID_PMSG NID:5848\n");
+
+            return 0;
         }
-    }
 
-    return 0;
-}
+        Client *receiver =
+            find_username(target);
 
-/* ================================================= */
-/* PMSG                                               */
-/* ================================================= */
-
-else if (strncmp(command, "PMSG ", 5) == 0)
-{
-    if (!client->registered)
-    {
-        snprintf(response,
-                 sizeof(response),
-                 "ERR 002 NOT_REGISTERED %s\n",
-                 NID);
-
-        send_response(client->fd, response);
-
-        return 0;
-    }
-
-    char target_username[USERNAME_SIZE];
-    char message[BUFFER_SIZE];
-
-    memset(target_username,
-           0,
-           sizeof(target_username));
-
-    memset(message,
-           0,
-           sizeof(message));
-
-    char *space = strchr(command + 5, ' ');
-
-    if (space == NULL)
-    {
-        snprintf(response,
-                 sizeof(response),
-                 "ERR 009 INVALID_PMSG %s\n",
-                 NID);
-
-        send_response(client->fd, response);
-
-        return 0;
-    }
-
-    int username_length =
-        space - (command + 5);
-
-    if (username_length <= 0 ||
-        username_length >= USERNAME_SIZE)
-    {
-        snprintf(response,
-                 sizeof(response),
-                 "ERR 009 INVALID_PMSG %s\n",
-                 NID);
-
-        send_response(client->fd, response);
-
-        return 0;
-    }
-
-    strncpy(target_username,
-            command + 5,
-            username_length);
-
-    target_username[username_length] =
-        '\0';
-
-    strcpy(message, space + 1);
-
-    if (strlen(message) == 0)
-    {
-        snprintf(response,
-                 sizeof(response),
-                 "ERR 009 INVALID_PMSG %s\n",
-                 NID);
-
-        send_response(client->fd, response);
-
-        return 0;
-    }
-
-    int target_found = 0;
-
-    for (int i = 0; i < MAX_CLIENTS; i++)
-    {
-        if (clients[i].fd != -1 &&
-            clients[i].registered &&
-            strcmp(clients[i].username,
-                   target_username) == 0)
+        if (receiver == NULL)
         {
-            char private_message[BUFFER_SIZE];
+            send_line(client->fd,
+                      "ERR 002 USER_NOT_FOUND NID:5848\n");
 
-            snprintf(private_message,
-                     sizeof(private_message),
-                     "MSG FROM %.49s %.950s\n",
-                     client->username,
-                     message);
-
-            send_response(clients[i].fd,
-                          private_message);
-
-            target_found = 1;
-
-            break;
+            return 0;
         }
-    }
 
-    if (!target_found)
-    {
         snprintf(response,
                  sizeof(response),
-                 "ERR 010 USER_NOT_FOUND %s\n",
+                 "OK SENT %s\n",
                  NID);
 
-        send_response(client->fd,
-                      response);
-    }
+        send_line(client->fd,
+                  response);
 
-    return 0;
-}
+        char msg[BUFFER_SIZE];
 
-/* ================================================= */
-/* JOIN                                               */
-/* ================================================= */
+        snprintf(msg,
+                 sizeof(msg),
+                 "MSG PRIV %s %s\n",
+                 client->username,
+                 message);
 
-else if (strncmp(command, "JOIN ", 5) == 0)
-{
-    if (!client->registered)
-    {
-        snprintf(response,
-                 sizeof(response),
-                 "ERR 002 NOT_REGISTERED %s\n",
-                 NID);
-
-        send_response(client->fd, response);
+        send_line(receiver->fd,
+                  msg);
 
         return 0;
     }
 
-    char room[USERNAME_SIZE];
 
-    memset(room, 0, sizeof(room));
+    /* ----------------------------------------------------- */
+    /* JOIN                                                    */
+    /* ----------------------------------------------------- */
 
-    sscanf(command + 5, "%49s", room);
-
-    if (strlen(room) == 0)
+    if (strncmp(command,
+                "JOIN ",
+                5) == 0)
     {
-        snprintf(response,
-                 sizeof(response),
-                 "ERR 011 INVALID_ROOM %s\n",
-                 NID);
+        char room[ROOM_SIZE];
 
-        send_response(client->fd, response);
+        memset(room, 0, sizeof(room));
 
-        return 0;
-    }
-
-    strcpy(client->room, room);
-
-    snprintf(response,
-             sizeof(response),
-             "OK JOINED %s %s\n",
-             room,
-             NID);
-
-    send_response(client->fd, response);
-
-    printf("%s joined room %s\n",
-           client->username,
-           room);
-
-    return 0;
-}
-
-/* ================================================= */
-/* LEAVE                                              */
-/* ================================================= */
-
-else if (strcmp(command, "LEAVE") == 0)
-{
-    if (!client->registered)
-    {
-        snprintf(response,
-                 sizeof(response),
-                 "ERR 002 NOT_REGISTERED %s\n",
-                 NID);
-
-        send_response(client->fd, response);
-
-        return 0;
-    }
-
-    if (strlen(client->room) == 0)
-    {
-        snprintf(response,
-                 sizeof(response),
-                 "ERR 012 NOT_IN_ROOM %s\n",
-                 NID);
-
-        send_response(client->fd, response);
-
-        return 0;
-    }
-
-    char old_room[USERNAME_SIZE];
-
-    strcpy(old_room, client->room);
-
-    client->room[0] = '\0';
-
-    snprintf(response,
-             sizeof(response),
-             "OK LEFT %s %s\n",
-             old_room,
-             NID);
-
-    send_response(client->fd, response);
-
-    printf("%s left room %s\n",
-           client->username,
-           old_room);
-
-    return 0;
-}
-
-/* ================================================= */
-/* RMSG                                               */
-/* ================================================= */
-
-else if (strncmp(command, "RMSG ", 5) == 0)
-{
-    if (!client->registered)
-    {
-        snprintf(response,
-                 sizeof(response),
-                 "ERR 002 NOT_REGISTERED %s\n",
-                 NID);
-
-        send_response(client->fd, response);
-
-        return 0;
-    }
-
-    char room[USERNAME_SIZE];
-    char message[BUFFER_SIZE];
-
-    memset(room, 0, sizeof(room));
-    memset(message, 0, sizeof(message));
-
-    char *space = strchr(command + 5, ' ');
-
-    if (space == NULL)
-    {
-        snprintf(response,
-                 sizeof(response),
-                 "ERR 013 INVALID_RMSG %s\n",
-                 NID);
-
-        send_response(client->fd, response);
-
-        return 0;
-    }
-
-    int room_length =
-        space - (command + 5);
-
-    if (room_length <= 0 ||
-        room_length >= USERNAME_SIZE)
-    {
-        snprintf(response,
-                 sizeof(response),
-                 "ERR 013 INVALID_RMSG %s\n",
-                 NID);
-
-        send_response(client->fd, response);
-
-        return 0;
-    }
-
-    strncpy(room,
-            command + 5,
-            room_length);
-
-    room[room_length] = '\0';
-
-    strcpy(message, space + 1);
-
-    if (strlen(message) == 0)
-    {
-        snprintf(response,
-                 sizeof(response),
-                 "ERR 013 INVALID_RMSG %s\n",
-                 NID);
-
-        send_response(client->fd, response);
-
-        return 0;
-    }
-
-    /* User must currently be in this room */
-
-    if (strcmp(client->room, room) != 0)
-    {
-        snprintf(response,
-                 sizeof(response),
-                 "ERR 014 NOT_IN_ROOM %s\n",
-                 NID);
-
-        send_response(client->fd, response);
-
-        return 0;
-    }
-
-    char room_message[BUFFER_SIZE];
-
-    snprintf(room_message,
-             sizeof(room_message),
-             "MSG ROOM %.49s FROM %.49s %.900s\n",
-             room,
-             client->username,
-             message);
-
-    int recipient_found = 0;
-
-    for (int i = 0; i < MAX_CLIENTS; i++)
-    {
-        if (clients[i].fd != -1 &&
-            clients[i].registered &&
-            strcmp(clients[i].room, room) == 0)
+        if (sscanf(command + 5,
+                   "%49s",
+                   room) != 1)
         {
-            send_response(clients[i].fd,
-                          room_message);
+            send_line(client->fd,
+                      "ERR 006 INVALID_JOIN NID:5848\n");
 
-            recipient_found = 1;
+            return 0;
         }
-    }
 
-    if (!recipient_found)
-    {
+        strncpy(client->room,
+                room,
+                ROOM_SIZE - 1);
+
+        client->room[ROOM_SIZE - 1] = '\0';
+
         snprintf(response,
                  sizeof(response),
-                 "ERR 015 ROOM_EMPTY %s\n",
+                 "OK JOINED %s %s\n",
+                 room,
                  NID);
 
-        send_response(client->fd, response);
+        send_line(client->fd,
+                  response);
+
+        return 0;
     }
 
-    return 0;
-}
 
-    /* ================================================= */
-    /* QUIT                                               */
-    /* ================================================= */
+    /* ----------------------------------------------------- */
+    /* LEAVE                                                   */
+    /* ----------------------------------------------------- */
 
-    else if (strcmp(command, "QUIT") == 0)
+    if (strncmp(command,
+                "LEAVE",
+                5) == 0)
     {
+        char room[ROOM_SIZE];
+
+        if (sscanf(command,
+                   "LEAVE %49s",
+                   room) != 1)
+        {
+            send_line(client->fd,
+                      "ERR 003 ROOM_NOT_FOUND NID:5848\n");
+
+            return 0;
+        }
+
+        if (strcmp(client->room,
+                   room) != 0)
+        {
+            send_line(client->fd,
+                      "ERR 003 ROOM_NOT_FOUND NID:5848\n");
+
+            return 0;
+        }
+
+        client->room[0] = '\0';
+
         snprintf(response,
                  sizeof(response),
-                 "OK BYE %s\n",
+                 "OK LEFT %s %s\n",
+                 room,
                  NID);
 
-        send_response(client->fd, response);
+        send_line(client->fd,
+                  response);
 
-        remove_client(clients,
-                      index,
-                      master_set);
+        return 0;
+    }
+
+
+    /* ----------------------------------------------------- */
+    /* ROOMS                                                   */
+    /* ----------------------------------------------------- */
+
+    if (strcmp(command,
+               "ROOMS") == 0)
+    {
+        char rooms[BUFFER_SIZE];
+
+        strcpy(rooms,
+               "OK ROOMS ");
+
+        int first = 1;
+        int i;
+        int j;
+
+        for (i = 0; i < MAX_CLIENTS; i++)
+        {
+            if (clients[i].fd == -1 ||
+                !clients[i].registered ||
+                clients[i].room[0] == '\0')
+            {
+                continue;
+            }
+
+            int duplicate = 0;
+
+            for (j = 0; j < i; j++)
+            {
+                if (clients[j].fd != -1 &&
+                    clients[j].registered &&
+                    strcmp(clients[j].room,
+                           clients[i].room) == 0)
+                {
+                    duplicate = 1;
+                    break;
+                }
+            }
+
+            if (!duplicate)
+            {
+                if (!first)
+                {
+                    strncat(rooms,
+                            ",",
+                            sizeof(rooms) -
+                            strlen(rooms) - 1);
+                }
+
+                strncat(rooms,
+                        clients[i].room,
+                        sizeof(rooms) -
+                        strlen(rooms) - 1);
+
+                first = 0;
+            }
+        }
+
+        strncat(rooms,
+                " ",
+                sizeof(rooms) -
+                strlen(rooms) - 1);
+
+        strncat(rooms,
+                NID,
+                sizeof(rooms) -
+                strlen(rooms) - 1);
+
+        strncat(rooms,
+                "\n",
+                sizeof(rooms) -
+                strlen(rooms) - 1);
+
+        send_line(client->fd,
+                  rooms);
+
+        return 0;
+    }
+
+
+    /* ----------------------------------------------------- */
+    /* RMSG                                                     */
+    /* ----------------------------------------------------- */
+
+    if (strncmp(command,
+                "RMSG ",
+                5) == 0)
+    {
+        char room[ROOM_SIZE];
+        char message[BUFFER_SIZE];
+
+        memset(room, 0, sizeof(room));
+        memset(message, 0, sizeof(message));
+
+        if (sscanf(command,
+                   "RMSG %49s %1023[^\n]",
+                   room,
+                   message) != 2)
+        {
+            send_line(client->fd,
+                      "ERR 006 INVALID_RMSG NID:5848\n");
+
+            return 0;
+        }
+
+        if (!room_exists(room))
+        {
+            send_line(client->fd,
+                      "ERR 003 ROOM_NOT_FOUND NID:5848\n");
+
+            return 0;
+        }
+
+        if (strcmp(client->room,
+                   room) != 0)
+        {
+            send_line(client->fd,
+                      "ERR 003 ROOM_NOT_FOUND NID:5848\n");
+
+            return 0;
+        }
+
+        snprintf(response,
+                 sizeof(response),
+                 "OK SENT %s\n",
+                 NID);
+
+        send_line(client->fd,
+                  response);
+
+        char msg[BUFFER_SIZE];
+
+        snprintf(msg,
+                 sizeof(msg),
+                 "MSG ROOM %s %s %s\n",
+                 room,
+                 client->username,
+                 message);
+
+        int i;
+
+        for (i = 0; i < MAX_CLIENTS; i++)
+        {
+            if (clients[i].fd != -1 &&
+                clients[i].registered &&
+                strcmp(clients[i].room,
+                       room) == 0 &&
+                &clients[i] != client)
+            {
+                send_line(clients[i].fd,
+                          msg);
+            }
+        }
+
+        return 0;
+    }
+
+
+    /* ----------------------------------------------------- */
+    /* SENDFILE                                                 */
+    /* ----------------------------------------------------- */
+
+    if (strncmp(command,
+                "SENDFILE ",
+                9) == 0)
+    {
+        return start_file_transfer(client,
+                                   command);
+    }
+
+
+    /* ----------------------------------------------------- */
+    /* QUIT                                                    */
+    /* ----------------------------------------------------- */
+
+    if (strcmp(command,
+               "QUIT") == 0)
+    {
+        send_line(client->fd,
+                  "OK BYE NID:5848\n");
 
         return 1;
     }
 
 
-    /* ================================================= */
-    /* Any other command                                  */
-    /* ================================================= */
+    /* ----------------------------------------------------- */
+    /* Unknown command                                         */
+    /* ----------------------------------------------------- */
 
-    else
-    {
-        snprintf(response,
-                 sizeof(response),
-                 "ERR 006 UNKNOWN_COMMAND %s\n",
-                 NID);
+    send_line(client->fd,
+              "ERR 006 UNKNOWN_COMMAND NID:5848\n");
 
-        send_response(client->fd, response);
-
-        return 0;
-    }
+    return 0;
 }
 
 
-/* -------------------------------------------------- */
-/* Main                                                */
-/* -------------------------------------------------- */
+/* ========================================================= */
+/* Remove client                                               */
+/* ========================================================= */
+
+static void remove_client(int index,
+                          fd_set *master_set)
+{
+    Client *client = &clients[index];
+
+    if (client->fd == -1)
+    {
+        return;
+    }
+
+    char username[USERNAME_SIZE];
+
+    strncpy(username,
+            client->username,
+            sizeof(username) - 1);
+
+    username[sizeof(username) - 1] = '\0';
+
+    if (client->file_fp != NULL)
+    {
+        fclose(client->file_fp);
+        client->file_fp = NULL;
+    }
+
+    if (client->registered)
+    {
+        notify_leave(username);
+
+        char logmsg[BUFFER_SIZE];
+
+        snprintf(logmsg,
+                 sizeof(logmsg),
+                 "DISCONNECT username=%s",
+                 username);
+
+        log_event(logmsg);
+    }
+
+    FD_CLR(client->fd,
+           master_set);
+
+    close(client->fd);
+
+    client->fd = -1;
+
+    reset_client(client);
+
+    printf("Client disconnected: %s\n",
+           username);
+}
+
+
+/* ========================================================= */
+/* Process data from one client                                */
+/* ========================================================= */
+
+static int process_received_data(int index,
+                                 const char *data,
+                                 size_t length,
+                                 fd_set *master_set)
+{
+    Client *client = &clients[index];
+
+    size_t offset = 0;
+
+
+    while (offset < length)
+    {
+        /*
+         * If receiving raw file bytes, consume exactly
+         * the number of bytes specified by SENDFILE.
+         */
+        if (client->receiving_file)
+        {
+            size_t remaining_input =
+                length - offset;
+
+            long remaining_file =
+                client->file_size -
+                client->file_received;
+
+            size_t amount =
+                remaining_file <
+                (long)remaining_input
+                    ? (size_t)remaining_file
+                    : remaining_input;
+
+            if (receive_file_bytes(
+                    client,
+                    data + offset,
+                    amount) < 0)
+            {
+                return 0;
+            }
+
+            offset += amount;
+
+            continue;
+        }
+
+
+        /*
+         * Otherwise this is command data.
+         *
+         * Append one byte at a time so partial TCP lines
+         * are handled correctly.
+         */
+        if (client->input_length >=
+            sizeof(client->input_buffer) - 1)
+        {
+            client->input_length = 0;
+
+            send_line(client->fd,
+                      "ERR 006 COMMAND_TOO_LONG NID:5848\n");
+
+            continue;
+        }
+
+        client->input_buffer[
+            client->input_length++] =
+            data[offset++];
+
+        client->input_buffer[
+            client->input_length] = '\0';
+
+
+        /*
+         * Search for newline.
+         */
+        char *newline =
+            memchr(client->input_buffer,
+                   '\n',
+                   client->input_length);
+
+        if (newline == NULL)
+        {
+            continue;
+        }
+
+
+        /*
+         * Calculate command length.
+         */
+        size_t command_length =
+            (size_t)(newline -
+                     client->input_buffer);
+
+        if (command_length > 0 &&
+            client->input_buffer[
+                command_length - 1] == '\r')
+        {
+            command_length--;
+        }
+
+
+        char command[INPUT_SIZE];
+
+        memcpy(command,
+               client->input_buffer,
+               command_length);
+
+        command[command_length] = '\0';
+
+
+        /*
+         * Remove processed command from buffer.
+         */
+        size_t remaining =
+            client->input_length -
+            (size_t)((newline -
+                      client->input_buffer) + 1);
+
+        memmove(client->input_buffer,
+                newline + 1,
+                remaining);
+
+        client->input_length = remaining;
+
+        client->input_buffer[
+            remaining] = '\0';
+
+
+        int should_close =
+            process_command(client,
+                            command,
+                            master_set);
+
+        if (should_close)
+        {
+            send_line(client->fd,
+                      "");
+
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+
+/* ========================================================= */
+/* Main                                                        */
+/* ========================================================= */
 
 int main(void)
 {
@@ -697,44 +1473,26 @@ int main(void)
 
     struct sockaddr_in server_addr;
 
-    Client clients[MAX_CLIENTS];
+    fd_set master_set;
+    fd_set read_set;
+
+    int max_fd;
 
 
-    /* ------------------------------------------------ */
-    /* Initialise client table                          */
-    /* ------------------------------------------------ */
-
-    for (int i = 0; i < MAX_CLIENTS; i++)
-    {
-        clients[i].fd = -1;
-        clients[i].registered = 0;
-        clients[i].username[0] = '\0';
-        clients[i].room[0]='\0';
-        clients[i].input_length = 0;
-        clients[i].input_buffer[0] = '\0';
-    }
+    initialise_clients();
 
 
-    /* ------------------------------------------------ */
-    /* Create socket                                    */
-    /* ------------------------------------------------ */
-
-    server_fd = socket(AF_INET,
-                       SOCK_STREAM,
-                       0);
+    server_fd =
+        socket(AF_INET,
+               SOCK_STREAM,
+               0);
 
     if (server_fd < 0)
     {
         perror("socket");
-        exit(EXIT_FAILURE);
+        return EXIT_FAILURE;
     }
 
-    printf("Server socket created successfully.\n");
-
-
-    /* ------------------------------------------------ */
-    /* Allow quick restart                              */
-    /* ------------------------------------------------ */
 
     int reuse = 1;
 
@@ -746,19 +1504,16 @@ int main(void)
     {
         perror("setsockopt");
         close(server_fd);
-        exit(EXIT_FAILURE);
+        return EXIT_FAILURE;
     }
 
-
-    /* ------------------------------------------------ */
-    /* Configure server address                         */
-    /* ------------------------------------------------ */
 
     memset(&server_addr,
            0,
            sizeof(server_addr));
 
-    server_addr.sin_family = AF_INET;
+    server_addr.sin_family =
+        AF_INET;
 
     server_addr.sin_addr.s_addr =
         INADDR_ANY;
@@ -767,83 +1522,68 @@ int main(void)
         htons(PORT);
 
 
-    /* ------------------------------------------------ */
-    /* Bind                                            */
-    /* ------------------------------------------------ */
-
     if (bind(server_fd,
              (struct sockaddr *)&server_addr,
              sizeof(server_addr)) < 0)
     {
         perror("bind");
         close(server_fd);
-        exit(EXIT_FAILURE);
+        return EXIT_FAILURE;
     }
 
-    printf("Server bound to port %d.\n",
-           PORT);
 
-
-    /* ------------------------------------------------ */
-    /* Listen                                           */
-    /* ------------------------------------------------ */
-
-    if (listen(server_fd, 10) < 0)
+    if (listen(server_fd,
+               10) < 0)
     {
         perror("listen");
         close(server_fd);
-        exit(EXIT_FAILURE);
+        return EXIT_FAILURE;
     }
 
-    printf("Server is listening...\n");
-    printf("Maximum clients: %d\n",
-           MAX_CLIENTS);
+
+    printf("========================================\n");
+    printf("NetMessenger Server\n");
+    printf("Registration : IT23584822\n");
+    printf("Port         : %d\n", PORT);
+    printf("NID          : 5848\n");
+    printf("========================================\n");
 
 
-    /* ------------------------------------------------ */
-    /* Create select() master set                       */
-    /* ------------------------------------------------ */
+    log_event("SERVER_STARTED");
 
-    fd_set master_set;
-    fd_set read_set;
 
     FD_ZERO(&master_set);
 
     FD_SET(server_fd,
            &master_set);
 
-    int max_fd = server_fd;
+    max_fd = server_fd;
 
-
-    /* ------------------------------------------------ */
-    /* Main server loop                                 */
-    /* ------------------------------------------------ */
 
     while (1)
     {
         read_set = master_set;
 
 
-        /* Wait until something happens */
-
-        int activity =
-            select(max_fd + 1,
+        if (select(max_fd + 1,
                    &read_set,
                    NULL,
                    NULL,
-                   NULL);
-
-        if (activity < 0)
+                   NULL) < 0)
         {
+            if (errno == EINTR)
+            {
+                continue;
+            }
+
             perror("select");
             break;
         }
 
 
-        /* ============================================ */
-        /* Check server socket                          */
-        /* ============================================ */
-
+        /*
+         * New connection.
+         */
         if (FD_ISSET(server_fd,
                      &read_set))
         {
@@ -852,90 +1592,74 @@ int main(void)
             socklen_t client_len =
                 sizeof(client_addr);
 
-            int client_fd =
+            int new_fd =
                 accept(server_fd,
                        (struct sockaddr *)&client_addr,
                        &client_len);
 
-            if (client_fd < 0)
+            if (new_fd < 0)
             {
                 perror("accept");
             }
             else
             {
-                printf("\nNew client connected from %s\n",
-                       inet_ntoa(client_addr.sin_addr));
+                int i;
+                int stored = 0;
 
-                int slot = -1;
-
-                for (int i = 0;
+                for (i = 0;
                      i < MAX_CLIENTS;
                      i++)
                 {
                     if (clients[i].fd == -1)
                     {
-                        slot = i;
+                        clients[i].fd =
+                            new_fd;
+
+                        reset_client(
+                            &clients[i]);
+
+                        /*
+                         * reset_client doesn't reset fd.
+                         */
+                        clients[i].fd =
+                            new_fd;
+
+                        FD_SET(new_fd,
+                               &master_set);
+
+                        if (new_fd > max_fd)
+                        {
+                            max_fd = new_fd;
+                        }
+
+                        stored = 1;
+
+                        printf("New client connected fd=%d\n",
+                               new_fd);
+
+                        log_event("CLIENT_CONNECTED");
+
                         break;
                     }
                 }
 
-
-                /* No free slot */
-
-                if (slot == -1)
+                if (!stored)
                 {
-                    char response[BUFFER_SIZE];
+                    send_line(new_fd,
+                              "ERR 006 SERVER_FULL NID:5848\n");
 
-                    snprintf(response,
-                             sizeof(response),
-                             "ERR 005 SERVER_FULL %s\n",
-                             NID);
-
-                    send_response(client_fd,
-                                  response);
-
-                    close(client_fd);
-
-                    printf("Connection rejected: server full.\n");
-                }
-                else
-                {
-                    clients[slot].fd =
-                        client_fd;
-
-                    clients[slot].registered =
-                        0;
-
-                    clients[slot].username[0] =
-                        '\0';
-
-                    clients[slot].input_length =
-                        0;
-
-                    clients[slot].input_buffer[0] =
-                        '\0';
-
-                    FD_SET(client_fd,
-                           &master_set);
-
-                    if (client_fd > max_fd)
-                    {
-                        max_fd = client_fd;
-                    }
-
-                    printf("Client assigned slot %d, fd=%d\n",
-                           slot,
-                           client_fd);
+                    close(new_fd);
                 }
             }
         }
 
 
-        /* ============================================ */
-        /* Check existing clients                       */
-        /* ============================================ */
+        /*
+         * Existing clients.
+         */
+        int i;
 
-        for (int i = 0;
+        for (i = 0;
              i < MAX_CLIENTS;
              i++)
         {
@@ -944,184 +1668,81 @@ int main(void)
                 continue;
             }
 
-
-            int client_fd =
-                clients[i].fd;
-
-
-            if (!FD_ISSET(client_fd,
+            if (!FD_ISSET(clients[i].fd,
                           &read_set))
             {
                 continue;
             }
 
 
-            /* ======================================== */
-            /* Receive data                              */
-            /* ======================================== */
+            char buffer[BUFFER_SIZE];
 
-            char temp_buffer[512];
+            int fd =
+                clients[i].fd;
 
-            int bytes_received =
-                recv(client_fd,
-                     temp_buffer,
-                     sizeof(temp_buffer) - 1,
+            ssize_t n =
+                recv(fd,
+                     buffer,
+                     sizeof(buffer),
                      0);
 
-
-            /* ======================================== */
-            /* Client disconnected                      */
-            /* ======================================== */
-
-            if (bytes_received <= 0)
+            if (n == 0)
             {
-                remove_client(clients,
-                              i,
+                remove_client(i,
+                              &master_set);
+
+                continue;
+            }
+
+            if (n < 0)
+            {
+                if (errno == EINTR)
+                {
+                    continue;
+                }
+
+                remove_client(i,
                               &master_set);
 
                 continue;
             }
 
 
-            temp_buffer[bytes_received] =
-                '\0';
+            int close_client =
+                process_received_data(
+                    i,
+                    buffer,
+                    (size_t)n,
+                    &master_set);
 
-
-            /* ======================================== */
-            /* Add data to client's buffer              */
-            /* ======================================== */
-
-            if (clients[i].input_length +
-                    bytes_received
-                >= BUFFER_SIZE - 1)
+            if (close_client)
             {
-                char response[BUFFER_SIZE];
-
-                snprintf(response,
-                         sizeof(response),
-                         "ERR 007 MESSAGE_TOO_LONG %s\n",
-                         NID);
-
-                send_response(client_fd,
-                              response);
-
-                clients[i].input_length = 0;
-
-                clients[i].input_buffer[0] =
-                    '\0';
-
-                continue;
-            }
-
-
-            memcpy(clients[i].input_buffer +
-                       clients[i].input_length,
-                   temp_buffer,
-                   bytes_received);
-
-            clients[i].input_length +=
-                bytes_received;
-
-            clients[i].input_buffer[
-                clients[i].input_length] =
-                '\0';
-
-
-            /* ======================================== */
-            /* Process complete lines                   */
-            /* ======================================== */
-
-            while (1)
-            {
-                char *newline =
-                    strchr(clients[i].input_buffer,
-                           '\n');
-
-                if (newline == NULL)
-                {
-                    break;
-                }
-
-
-                int line_length =
-                    newline -
-                    clients[i].input_buffer;
-
-
-                char command[BUFFER_SIZE];
-
-
-                memcpy(command,
-                       clients[i].input_buffer,
-                       line_length);
-
-                command[line_length] =
-                    '\0';
-
-
-                /* Remove CR if present */
-
-                if (line_length > 0 &&
-                    command[line_length - 1] ==
-                        '\r')
-                {
-                    command[line_length - 1] =
-                        '\0';
-                }
-
-
-                /* Remove processed line */
-
-                int remaining =
-                    clients[i].input_length -
-                    (line_length + 1);
-
-
-                memmove(clients[i].input_buffer,
-                        newline + 1,
-                        remaining);
-
-
-                clients[i].input_length =
-                    remaining;
-
-                clients[i].input_buffer[
-                    remaining] =
-                    '\0';
-
-
-                /* Process command */
-
-                int disconnected =
-                    process_command(clients,
-                                    i,
-                                    command,
-                                    &master_set);
-
-                if (disconnected)
-                {
-                    break;
-                }
+                remove_client(i,
+                              &master_set);
             }
         }
     }
 
 
-    /* ------------------------------------------------ */
-    /* Cleanup                                          */
-    /* ------------------------------------------------ */
+    /*
+     * Shutdown.
+     */
+    int i;
 
-    for (int i = 0;
+    for (i = 0;
          i < MAX_CLIENTS;
          i++)
     {
         if (clients[i].fd != -1)
         {
-            close(clients[i].fd);
+            remove_client(i,
+                          &master_set);
         }
     }
 
     close(server_fd);
+
+    log_event("SERVER_STOPPED");
 
     return 0;
 }
