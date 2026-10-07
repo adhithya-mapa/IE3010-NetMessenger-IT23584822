@@ -1,0 +1,15 @@
+CC     = gcc
+CFLAGS = -Wall -Wextra
+
+.PHONY: all server client clean
+
+all: server client
+
+server:
+	$(CC) $(CFLAGS) server_4822.c -o server_4822
+
+client:
+	$(CC) $(CFLAGS) client_4822.c -o client_4822
+
+clean:
+	rm -f server_4822 client_4822
